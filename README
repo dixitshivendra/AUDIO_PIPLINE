@@ -1,0 +1,514 @@
+# RAKSHA Enterprise Audio Emergency Dispatch Pipeline
+
+## Overview
+
+RAKSHA is an AI-powered emergency audio processing platform designed to analyze roadside emergency calls, extract structured crisis information, and route uncertain cases for human review.
+
+The system combines speech-to-text transcription, audio enhancement, LLM-based emergency classification, structured data extraction, asynchronous processing, and audit-friendly quarantine workflows.
+
+The project is built using a production-style architecture with FastAPI, Celery, PostgreSQL, Redis, MinIO, FFmpeg, Groq Whisper, and Llama 3.3.
+
+---
+
+## Key Features
+
+### Emergency Audio Processing
+
+* Upload roadside emergency audio recordings.
+* Automatic audio normalization and cleaning.
+* Noise filtering using FFmpeg.
+
+### AI-Powered Speech Recognition
+
+* Groq Whisper Large v3 transcription.
+* Segment-level confidence analysis.
+* No-speech probability validation.
+
+### Structured Emergency Extraction
+
+Extracts:
+
+* Emergency severity
+* Vehicle type
+* Victim count
+* Human review requirements
+* Rejection reasons
+
+### Human Review Workflow
+
+Low-confidence or ambiguous audio is automatically quarantined for manual inspection.
+
+### Asynchronous Processing
+
+* Celery task queue
+* Redis message broker
+* Background processing workers
+
+### Object Storage
+
+* MinIO S3-compatible storage
+* Audio archival
+* Secure file handling
+
+### Persistence Layer
+
+* PostgreSQL database
+* Structured extraction storage
+* Quarantine audit records
+
+### API Security
+
+* API Key authentication
+* Request validation
+* Controlled endpoint access
+
+---
+
+## System Architecture
+
+Client
+↓
+FastAPI API
+↓
+MinIO Object Storage
+↓
+Celery Queue
+↓
+Redis Broker
+↓
+Worker Service
+↓
+FFmpeg Audio Cleaning
+↓
+Groq Whisper
+↓
+Llama 3.3 Extraction
+↓
+Pydantic Validation
+↓
+PostgreSQL Database
+
+---
+
+## Technology Stack
+
+### Backend
+
+* Python 3.11
+* FastAPI
+* SQLAlchemy
+* Alembic
+
+### AI / ML
+
+* Groq Whisper Large v3
+* Llama 3.3 70B Versatile
+* Pydantic Structured Validation
+
+### Infrastructure
+
+* Docker
+* Docker Compose
+* Celery
+* Redis
+* PostgreSQL
+* MinIO
+
+### Audio Processing
+
+* FFmpeg
+
+---
+
+## Project Structure
+
+```text
+enterprise-audio-pipeline/
+
+├── api/
+│   └── main.py
+│
+├── worker/
+│   ├── tasks.py
+│   ├── llm_extraction.py
+│   ├── audio_ops.py
+│   └── celery_app.py
+│
+├── storage/
+│   └── client.py
+│
+├── db/
+│   ├── database.py
+│   └── models.py
+│
+├── alembic/
+│
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Database Design
+
+### Jobs Table
+
+Stores processing status.
+
+```sql
+id UUID PRIMARY KEY
+status ENUM
+extracted_data JSONB
+error_detail TEXT
+created_at TIMESTAMP
+updated_at TIMESTAMP
+```
+
+### Quarantine Records
+
+Stores failed or uncertain cases.
+
+```sql
+id UUID PRIMARY KEY
+job_id UUID
+reason TEXT
+transcript_excerpt TEXT
+confidence_score FLOAT
+raw_audio_key TEXT
+clean_audio_key TEXT
+created_at TIMESTAMP
+```
+
+---
+
+## Processing Pipeline
+
+### Step 1 — Upload Audio
+
+Client uploads audio file:
+
+```bash
+curl -X POST \
+-H "X-API-Key: YOUR_API_KEY" \
+-F "file=@emergency.m4a" \
+http://localhost:8000/api/v1/upload
+```
+
+Response:
+
+```json
+{
+  "job_id": "uuid",
+  "status": "pending"
+}
+```
+
+---
+
+### Step 2 — Audio Storage
+
+Audio is stored inside MinIO.
+
+Generated object key:
+
+```text
+incoming/job_uuid.wav
+```
+
+---
+
+### Step 3 — Queue Processing
+
+Job dispatched to:
+
+```text
+Redis
+↓
+Celery Worker
+```
+
+---
+
+### Step 4 — Audio Enhancement
+
+FFmpeg pipeline:
+
+* Resampling
+* Volume normalization
+* Noise cleanup
+
+Output:
+
+```text
+clean_temp.wav
+```
+
+---
+
+### Step 5 — Transcription
+
+Groq Whisper Large v3:
+
+```python
+client.audio.transcriptions.create(
+    model="whisper-large-v3"
+)
+```
+
+Outputs:
+
+* Transcript
+* Segment confidence
+* No-speech probability
+
+---
+
+### Step 6 — Confidence Validation
+
+Validation Rules:
+
+```python
+avg_no_speech > 0.45
+```
+
+```python
+avg_logprob < -1.0
+```
+
+```python
+transcript_word_count < 4
+```
+
+Invalid audio is quarantined.
+
+---
+
+### Step 7 — Emergency Extraction
+
+Llama 3.3 receives transcript.
+
+Structured JSON is generated:
+
+```json
+{
+  "is_actionable_emergency": true,
+  "severity": "high",
+  "vehicle_type": "car",
+  "victim_count": 2
+}
+```
+
+---
+
+### Step 8 — Pydantic Validation
+
+Strict schema validation.
+
+Rejects:
+
+* Missing fields
+* Invalid severity
+* Inconsistent outputs
+
+---
+
+### Step 9 — Persistence
+
+Valid records:
+
+```text
+Status = completed
+```
+
+Stored in:
+
+```text
+jobs
+```
+
+Invalid records:
+
+```text
+Status = quarantine
+```
+
+Stored in:
+
+```text
+quarantine_records
+```
+
+---
+
+## API Endpoints
+
+### Upload Audio
+
+```http
+POST /api/v1/upload
+```
+
+Headers:
+
+```http
+X-API-Key: your_key
+```
+
+Form Data:
+
+```text
+file=@audio.m4a
+```
+
+---
+
+### Check Status
+
+```http
+GET /api/v1/status/{job_id}
+```
+
+Example:
+
+```bash
+curl \
+-H "X-API-Key: your_key" \
+http://localhost:8000/api/v1/status/job_id
+```
+
+Response:
+
+```json
+{
+  "job_id": "...",
+  "status": "completed"
+}
+```
+
+---
+
+## Local Development
+
+### Clone Repository
+
+```bash
+git clone <repo_url>
+cd enterprise-audio-pipeline
+```
+
+### Environment Variables
+
+Create:
+
+```bash
+.env
+```
+
+Example:
+
+```env
+OPENAI_API_KEY=YOUR_GROQ_API_KEY
+
+DATABASE_URL=postgresql://postgres:postgres@db:5432/audio_pipeline
+
+REDIS_URL=redis://redis:6379/0
+
+MINIO_ENDPOINT=minio:9000
+MINIO_ACCESS_KEY=admin
+MINIO_SECRET_KEY=password123
+
+API_KEY=raksha_secure_key_999
+```
+
+---
+
+### Start Services
+
+```bash
+docker compose up -d
+```
+
+Verify:
+
+```bash
+docker ps
+```
+
+Expected:
+
+```text
+postgres
+redis
+minio
+api
+worker
+```
+
+---
+
+## Testing
+
+### Emergency Audio
+
+Expected:
+
+```json
+{
+  "status": "completed"
+}
+```
+
+### Noise Audio
+
+Expected:
+
+```json
+{
+  "status": "quarantine"
+}
+```
+
+Example quarantine reason:
+
+```text
+LowConfidenceException:
+High no-speech probability (0.95)
+```
+
+---
+
+## Security Considerations
+
+* API Key Authentication
+* Isolated Object Storage
+* Validation Gates
+* Human Review Routing
+* Secure Cleanup of Temporary Files
+* Database Audit Trail
+
+---
+
+## Future Enhancements
+
+* GPS location extraction
+* Road name detection
+* Injury classification
+* Multi-language support
+* Live emergency call streaming
+* SMS dispatch integration
+* Police and ambulance routing
+* Real-time dashboard
+* Analytics and monitoring
+* Kubernetes deployment
+
+---
+
+## Author
+
+Sivendra Dixit
+
+RAKSHA Emergency Intelligence Platform
+
+AI-Powered Highway Emergency Detection and Dispatch System
