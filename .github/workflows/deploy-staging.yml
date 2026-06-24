@@ -1,0 +1,76 @@
+name: Deploy Staging
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/${{ github.repository }}/api
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging server
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            cd /opt/raksha
+
+            # Pull latest images
+            echo ">>> Pulling images..."
+            docker compose -f docker-compose.prod.yml pull api frontend worker
+
+            # Run migrations
+            echo ">>> Running migrations..."
+            docker compose -f docker-compose.prod.yml run --rm api alembic upgrade head
+
+            # Restart services with zero-downtime
+            echo ">>> Rolling restart..."
+            docker compose -f docker-compose.prod.yml up -d --force-recreate api frontend worker
+
+            # Wait for health
+            echo ">>> Waiting for API health check..."
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                echo ">>> API is healthy"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo ">>> ERROR: API failed health check"
+                docker compose -f docker-compose.prod.yml logs --tail=50 api
+                exit 1
+              fi
+              sleep 2
+            done
+
+            # Cleanup old images
+            echo ">>> Pruning old images..."
+            docker image prune -f --filter "until=168h"
+
+            echo ">>> Staging deployment complete"
+
+      - name: Notify deployment
+        if: success()
+        run: |
+          echo "Deployed commit ${{ github.sha }} to staging"
+          echo "API image: ${{ env.API_IMAGE }}:${{ github.sha }}"

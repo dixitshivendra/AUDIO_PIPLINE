@@ -1,0 +1,238 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+# ─────────────────────────────────────────────────────────────
+# Jobs that run in parallel on every push/PR
+# ─────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Backend lint + typecheck ──────────────────────────────
+  lint-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy
+        run: mypy api/ core/ db/ worker/ --ignore-missing-imports
+
+  # ── Backend tests ────────────────────────────────────────
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          DATABASE_URL: "sqlite:///:memory:"
+          JWT_SECRET_KEY: "test-jwt-secret-key-for-ci-only"
+          REDIS_URL: "redis://localhost:6379/0"
+          OPENAI_API_KEY: "test-key"
+          AASIOM_DISPATCH_API_KEY: "test-api-key"
+          S3_ENDPOINT_URL: "http://localhost:9000"
+          S3_BUCKET_NAME: "test-bucket"
+          FRONTEND_URL: "http://localhost:3000"
+          DISABLE_RATE_LIMITING: "1"
+          SMTP_HOST: "localhost"
+          SMTP_PORT: "25"
+        run: pytest tests/ -v --tb=short --cov=. --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ── Validate Alembic migrations ──────────────────────────
+  validate-migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: raksha
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: audio_pipeline_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U raksha"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements*.txt') }}
+          restore-keys: pip-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: "postgresql://raksha:testpassword@localhost:5432/audio_pipeline_test"
+        run: alembic upgrade head
+
+      - name: Verify migration head
+        env:
+          DATABASE_URL: "postgresql://raksha:testpassword@localhost:5432/audio_pipeline_test"
+        run: |
+          HEAD=$(alembic heads --verbose 2>&1 | grep "^Rev:" | awk '{print $2}')
+          echo "Migration head: $HEAD"
+          if [ -z "$HEAD" ]; then
+            echo "ERROR: Could not determine migration head"
+            exit 1
+          fi
+
+  # ── Frontend lint + typecheck + build ────────────────────
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: raksha-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: raksha-frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_API_URL: "http://localhost:8000"
+        run: npm run build
+
+  # ── Security scan ────────────────────────────────────────
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit Python dependencies
+        run: pip-audit -r requirements.txt
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
+# ─────────────────────────────────────────────────────────────
+# Build + push images (only on merge to main, after all checks)
+# ─────────────────────────────────────────────────────────────
+  build-and-push:
+    needs: [lint-backend, test-backend, validate-migrations, frontend, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: api
+            context: .
+            image: ghcr.io/${{ github.repository }}/api
+          - name: frontend
+            context: ./raksha-frontend
+            image: ghcr.io/${{ github.repository }}/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ matrix.image }}:${{ github.sha }}
+            ${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max

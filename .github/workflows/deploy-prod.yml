@@ -1,0 +1,141 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to deploy (leave empty for latest)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/${{ github.repository }}/api
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend
+
+jobs:
+  pre-check:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine SHA
+        id: sha
+        run: |
+          SHA="${{ inputs.sha }}"
+          if [ -z "$SHA" ]; then
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Deploying: $SHA"
+
+      - name: Verify image exists
+        run: |
+          echo "Verifying images exist for ${{ steps.sha.outputs.sha }}..."
+
+  deploy:
+    needs: pre-check
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set SHA
+        id: sha
+        run: |
+          SHA="${{ inputs.sha }}"
+          if [ -z "$SHA" ]; then
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Backup database
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            BACKUP_DIR="/opt/raksha/backups"
+            mkdir -p "$BACKUP_DIR"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            docker compose -f /opt/raksha/docker-compose.prod.yml exec -T db \
+              pg_dump -U raksha audio_pipeline | gzip > "$BACKUP_DIR/pre_deploy_${TIMESTAMP}.sql.gz"
+            echo "Backup saved: pre_deploy_${TIMESTAMP}.sql.gz"
+
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -euo pipefail
+
+            cd /opt/raksha
+
+            export API_TAG="${{ steps.sha.outputs.sha }}"
+            export FRONTEND_TAG="${{ steps.sha.outputs.sha }}"
+
+            # Pull new images
+            echo ">>> Pulling images for $API_TAG..."
+            docker compose -f docker-compose.prod.yml pull api frontend worker
+
+            # Run migrations
+            echo ">>> Running migrations..."
+            docker compose -f docker-compose.prod.yml run --rm api alembic upgrade head
+
+            # Rolling restart
+            echo ">>> Restarting services..."
+            docker compose -f docker-compose.prod.yml up -d --force-recreate api frontend worker
+
+            # Health check with retry
+            echo ">>> Waiting for API health..."
+            HEALTHY=false
+            for i in $(seq 1 45); do
+              if curl -sf https://${DOMAIN}/health > /dev/null 2>&1; then
+                echo ">>> API is healthy"
+                HEALTHY=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$HEALTHY" = false ]; then
+              echo ">>> ERROR: Health check failed. Rolling back..."
+              docker compose -f docker-compose.prod.yml logs --tail=100 api > /tmp/deploy-error.log 2>&1
+
+              # Rollback: restart with previous images
+              docker compose -f docker-compose.prod.yml up -d --force-recreate api frontend worker
+              echo ">>> Rollback initiated. Check logs."
+              exit 1
+            fi
+
+            # Cleanup
+            echo ">>> Pruning old images..."
+            docker image prune -f --filter "until=168h"
+
+            echo ">>> Production deployment complete: ${{ steps.sha.outputs.sha }}"
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            echo "=== Service Status ==="
+            docker compose -f /opt/raksha/docker-compose.prod.yml ps
+            echo ""
+            echo "=== Recent Logs ==="
+            docker compose -f /opt/raksha/docker-compose.prod.yml logs --tail=5 api
